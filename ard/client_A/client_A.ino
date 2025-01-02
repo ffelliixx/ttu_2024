@@ -1,96 +1,111 @@
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
-const char *ssid = "felixman";
-const char *pwd = "felixman";
-const char *udpAddress = "192.168.3.10";
-const int udpPort = 16888;
+// WiFi 設定
+const char* ssid = "felixman";       // WiFi 名稱
+const char* password = "felixman";   // WiFi 密碼
 
+// UDP 設定
 WiFiUDP udp;
+const char* udpAddress = "192.168.1.230"; // 目標裝置 IP，修改為接收端 IP
+const int udpPort = 16888;                // 目標 Port
 
+// MPU6050 設定
 Adafruit_MPU6050 mpu;
 
-unsigned long previousMillis = 0;
-const long interval = 1000;
+// 震動閾值 (根據需求調整，單位：m/s²)
+#define VIBRATION_THRESHOLD_1 10.5 
+#define VIBRATION_THRESHOLD_2 9.5
+
+// 時間變數
+unsigned long lastSensorReadTime = 0; // 上一次讀取感測器的時間
+unsigned long lastMessageTime = 0;   // 上一次傳送訊息的時間
+unsigned long delayDuration = 200;   // 預設傳送間隔 (毫秒)
+unsigned long vibrationPause = 15000; // 震動後暫停時間 (毫秒)
+bool inPause = false;                 // 是否處於震動暫停狀態
 
 void setup() {
+  // Serial 設定
   Serial.begin(115200);
-  
-  //setup wifi
-  WiFi.begin(ssid, pwd);
-  while (WiFi.status() !=WL_CONNECTED){
-    delay(500);
-    Serial.println("Connecting");
-      }
-    Serial.println("Connected!");
-  
-  //MPU6050
-  if (!mpu.begin()) {
-    Serial.println("Failed");
-    while (1) {
-      delay(10);
-    }
+
+  // WiFi 連線
+  WiFi.begin(ssid, password);
+  Serial.print("連線中");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
   }
-  Serial.println("Found!");
+  Serial.println("\nWiFi 已連線！");
+  Serial.print("IP 位址: ");
+  Serial.println(WiFi.localIP());
+
+  // 初始化 MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 初始化失敗！");
+    while (1);
+  }
+  Serial.println("MPU6050 初始化成功！");
 
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  Serial.print("Accelerometer range set to: ");
-  switch (mpu.getAccelerometerRange()) {
-  case MPU6050_RANGE_2_G: Serial.println("+-2G"); break;
-  case MPU6050_RANGE_4_G: Serial.println("+-4G"); break;
-  case MPU6050_RANGE_8_G: Serial.println("+-8G"); break;
-  case MPU6050_RANGE_16_G: Serial.println("+-16G"); break;
-  }
-
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  Serial.print("Gyro range set to: ");
-  switch (mpu.getGyroRange()) {
-  case MPU6050_RANGE_250_DEG: Serial.println("+- 250 deg/s"); break;
-  case MPU6050_RANGE_500_DEG: Serial.println("+- 500 deg/s"); break;
-  case MPU6050_RANGE_1000_DEG: Serial.println("+- 1000 deg/s"); break;
-  case MPU6050_RANGE_2000_DEG: Serial.println("+- 2000 deg/s"); break;
-  }
-
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  Serial.print("Filter bandwidth set to: ");
-  switch (mpu.getFilterBandwidth()) {
-  case MPU6050_BAND_260_HZ: Serial.println("260 Hz"); break;
-  case MPU6050_BAND_184_HZ: Serial.println("184 Hz"); break;
-  case MPU6050_BAND_94_HZ: Serial.println("94 Hz"); break;
-  case MPU6050_BAND_44_HZ: Serial.println("44 Hz"); break;
-  case MPU6050_BAND_21_HZ: Serial.println("21 Hz"); break;
-  case MPU6050_BAND_10_HZ: Serial.println("10 Hz"); break;
-  case MPU6050_BAND_5_HZ: Serial.println("5 Hz"); break;
-  }
-  udp.beginPacket(udpAddress, udpPort);
-  udp.write((const uint8_t *)"A_finish_setup", strlen("A_finish_setup"));
-  udp.endPacket();
-  delay(100);
+
+  Serial.println("系統已準備好！");
 }
 
 void loop() {
-  //clock
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
+  unsigned long currentTime = millis();
 
-  //mpu6050data
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  // 確保每 200ms 讀取一次感測器數據
+  if (currentTime - lastSensorReadTime >= delayDuration) {
+    lastSensorReadTime = currentTime;
 
-  //wifi checking
-  if (WiFi.status() == WL_CONNECTED) {
-    char buffer[128];
-      snprintf(buffer, sizeof(buffer), 
-               "(A)%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", 
-               a.acceleration.x, a.acceleration.y, a.acceleration.z, 
-               g.gyro.x, g.gyro.y, g.gyro.z, temp.temperature); 
-    udp.beginPacket(udpAddress, udpPort); 
-    udp.write((const uint8_t *)buffer, strlen(buffer));
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // 計算加速度的變化幅度
+    float accelerationMagnitude = sqrt(
+        a.acceleration.x * a.acceleration.x +
+        a.acceleration.y * a.acceleration.y +
+        a.acceleration.z * a.acceleration.z);
+
+    String message; // 傳送訊息
+
+    if (inPause) {
+      // 暫停期間，發送 "a, accelerationMagnitude"
+      message = "a, " + String(accelerationMagnitude);
+      Serial.println(message);
+    } else {
+      // 偵測震動並組成訊息
+      if (accelerationMagnitude > VIBRATION_THRESHOLD_1 || accelerationMagnitude < VIBRATION_THRESHOLD_2) {
+        message = "AAAA";
+        Serial.println(message);
+
+        // 發送 UDP 訊息
+        udp.beginPacket(udpAddress, udpPort);
+        udp.print(message);
+        udp.endPacket();
+
+        // 設定為暫停狀態
+        inPause = true;
+        lastSensorReadTime = currentTime; // 記錄暫停開始時間
+      } else {
+        message = "A, " + String(accelerationMagnitude);
+        Serial.println(message);
+      }
+    }
+
+    // 每隔 delayDuration 發送訊息
+    udp.beginPacket(udpAddress, udpPort);
+    udp.print(message);
     udp.endPacket();
+
+    // 結束暫停狀態
+    if (inPause && (currentTime - lastSensorReadTime >= vibrationPause)) {
+      inPause = false;
     }
   }
 }
